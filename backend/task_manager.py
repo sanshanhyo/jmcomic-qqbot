@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import signal
 import sqlite3
+import subprocess
+import sys
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from . import downloader
 from .models import JobStatus
 
 logger = logging.getLogger(__name__)
@@ -19,6 +23,12 @@ class DuplicateJobError(Exception):
     def __init__(self, existing_job: dict[str, Any]) -> None:
         super().__init__("duplicate active job")
         self.existing_job = existing_job
+
+
+class DownloadWorkerError(Exception):
+    def __init__(self, user_message: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
 
 
 @dataclass(frozen=True)
@@ -222,23 +232,18 @@ class JobManager:
         self._update_status(job_id, JobStatus.DOWNLOADING, "开始下载，正在获取本子信息")
 
         try:
-            pdf_path = await self._run_download_with_progress(
+            pdf_path = await self._run_download_process_with_progress(
                 job_id,
+                album_id,
                 job_dir,
-                asyncio.to_thread(
-                    downloader.download_album_pdf,
-                    album_id,
-                    self.config.option_path,
-                    job_dir,
-                ),
             )
             self._update_status(job_id, JobStatus.CONVERTING, "图片下载完成，正在生成 PDF")
             self._mark_completed(job_id, pdf_path)
         except asyncio.TimeoutError:
             logger.exception("Job %s timed out.", job_id)
             self._mark_failed(job_id, "下载超时，请稍后重试")
-        except downloader.DownloaderError as exc:
-            logger.exception("Job %s failed in downloader.", job_id)
+        except DownloadWorkerError as exc:
+            logger.warning("Job %s failed in download worker: %s", job_id, exc.user_message)
             self._mark_failed(job_id, exc.user_message)
         except Exception:
             logger.exception("Job %s failed unexpectedly.", job_id)
@@ -283,25 +288,114 @@ class JobManager:
                 (JobStatus.FAILED.value, error_message, self._now(), error_message, job_id),
             )
 
-    async def _run_download_with_progress(
+    async def _run_download_process_with_progress(
         self,
         job_id: str,
+        album_id: str,
         job_dir: Path,
-        awaitable: Any,
         progress_interval_seconds: float = 10.0,
     ) -> Path:
-        task = asyncio.create_task(awaitable)
+        job_dir.mkdir(parents=True, exist_ok=True)
+        result_path = job_dir / "download-result.json"
+        result_path.unlink(missing_ok=True)
+
+        command = self._download_worker_command(album_id, job_dir, result_path)
+        process = await self._start_download_process(command)
         deadline = asyncio.get_running_loop().time() + self.config.job_timeout_seconds
 
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=progress_interval_seconds)
-            if done:
-                return task.result()
+        try:
+            while process.returncode is None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    await self._terminate_download_process(process)
+                    raise asyncio.TimeoutError
+
+                try:
+                    await asyncio.wait_for(
+                        process.wait(),
+                        timeout=min(progress_interval_seconds, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    self._update_download_progress(job_id, job_dir)
+                    continue
 
             self._update_download_progress(job_id, job_dir)
-            if asyncio.get_running_loop().time() >= deadline:
-                task.cancel()
-                raise asyncio.TimeoutError
+            return self._read_download_result(result_path, process.returncode)
+        except asyncio.CancelledError:
+            await self._terminate_download_process(process)
+            raise
+
+    def _download_worker_command(self, album_id: str, job_dir: Path, result_path: Path) -> list[str]:
+        return [
+            sys.executable,
+            "-m",
+            "backend.download_worker",
+            "--album-id",
+            album_id,
+            "--option-path",
+            str(self.config.option_path),
+            "--job-dir",
+            str(job_dir),
+            "--result-path",
+            str(result_path),
+        ]
+
+    async def _start_download_process(self, command: list[str]) -> asyncio.subprocess.Process:
+        kwargs: dict[str, Any] = {
+            "stdout": asyncio.subprocess.DEVNULL,
+            "stderr": asyncio.subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs["start_new_session"] = True
+        return await asyncio.create_subprocess_exec(*command, **kwargs)
+
+    async def _terminate_download_process(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+
+        logger.warning("Terminating stuck download process pid=%s.", process.pid)
+        try:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+            return
+        except asyncio.TimeoutError:
+            logger.warning("Killing stuck download process pid=%s.", process.pid)
+
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+        await process.wait()
+
+    def _read_download_result(self, result_path: Path, returncode: int | None) -> Path:
+        if not result_path.is_file():
+            raise DownloadWorkerError(f"下载进程异常退出，退出码：{returncode}")
+
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise DownloadWorkerError("下载进程结果文件无效") from exc
+
+        if not result.get("ok"):
+            raise DownloadWorkerError(result.get("user_message") or "下载失败，请稍后重试")
+
+        pdf_path = result.get("pdf_path")
+        if not isinstance(pdf_path, str) or not pdf_path:
+            raise DownloadWorkerError("PDF 生成失败：结果路径无效")
+        return Path(pdf_path).resolve()
 
     def _update_download_progress(self, job_id: str, job_dir: Path) -> None:
         downloaded_files = self._count_downloaded_images(job_dir)

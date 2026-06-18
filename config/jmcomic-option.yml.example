@@ -2,19 +2,26 @@
 # Do not commit cookies, tokens, or login information.
 
 client:
-  impl: html
+  # api is usually better for servers because the html client may be blocked by IP region.
+  impl: api
   retry_times: 5
   postman:
     meta_data:
       headers:
         User-Agent: "Mozilla/5.0"
-        Cookie: "YOUR_JMCOMIC_COOKIE_HERE"
+      cookies:
+        # Log in with your browser and copy the AVS cookie for the same JM domain.
+        # Do not commit your real cookie.
+        AVS: "YOUR_JMCOMIC_AVS_COOKIE_HERE"
 
 download:
   image:
     decode: true
+  threading:
+    # Increase carefully. Too high may trigger rate limits or make uploads slower overall.
+    image: 20
+    photo: 4
 
 dir_rule:
   base_dir: ./data/jmcomic
   rule: Bd_Aid_Pindex
-

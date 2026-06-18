@@ -32,4 +32,5 @@ class JobResponse(BaseModel):
     status: JobStatus
     filename: str | None = None
     error_message: str | None = None
-
+    downloaded_files: int = 0
+    progress_message: str | None = None

@@ -30,6 +30,8 @@ class JobManagerConfig:
 
 
 class JobManager:
+    IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+
     def __init__(self, config: JobManagerConfig) -> None:
         self.config = config
         self.data_dir = config.data_dir.resolve()
@@ -53,11 +55,15 @@ class JobManager:
                     filename TEXT,
                     file_path TEXT,
                     error_message TEXT,
+                    downloaded_files INTEGER NOT NULL DEFAULT 0,
+                    progress_message TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
                 """
             )
+            self._ensure_column(conn, "downloaded_files", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "progress_message", "TEXT")
             conn.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_album_group
@@ -112,9 +118,10 @@ class JobManager:
                     """
                     INSERT INTO jobs (
                         job_id, album_id, group_id, user_id, status,
-                        filename, file_path, error_message, created_at, updated_at
+                        filename, file_path, error_message, downloaded_files,
+                        progress_message, created_at, updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, 0, ?, ?, ?)
                     """,
                     (
                         job_id,
@@ -122,6 +129,7 @@ class JobManager:
                         group_id,
                         user_id,
                         JobStatus.QUEUED.value,
+                        "排队中，等待下载 worker 处理",
                         now,
                         now,
                     ),
@@ -143,7 +151,8 @@ class JobManager:
             row = conn.execute(
                 """
                 SELECT job_id, album_id, group_id, user_id, status,
-                       filename, file_path, error_message, created_at, updated_at
+                       filename, file_path, error_message, downloaded_files,
+                       progress_message, created_at, updated_at
                 FROM jobs
                 WHERE job_id = ?
                 """,
@@ -169,7 +178,8 @@ class JobManager:
             row = conn.execute(
                 """
                 SELECT job_id, album_id, group_id, user_id, status,
-                       filename, file_path, error_message, created_at, updated_at
+                       filename, file_path, error_message, downloaded_files,
+                       progress_message, created_at, updated_at
                 FROM jobs
                 WHERE album_id = ?
                   AND group_id = ?
@@ -209,19 +219,20 @@ class JobManager:
 
         album_id = job["album_id"]
         job_dir = self.jobs_dir / job_id
-        self._update_status(job_id, JobStatus.DOWNLOADING)
+        self._update_status(job_id, JobStatus.DOWNLOADING, "开始下载，正在获取本子信息")
 
         try:
-            pdf_path = await asyncio.wait_for(
+            pdf_path = await self._run_download_with_progress(
+                job_id,
+                job_dir,
                 asyncio.to_thread(
                     downloader.download_album_pdf,
                     album_id,
                     self.config.option_path,
                     job_dir,
                 ),
-                timeout=self.config.job_timeout_seconds,
             )
-            self._update_status(job_id, JobStatus.CONVERTING)
+            self._update_status(job_id, JobStatus.CONVERTING, "图片下载完成，正在生成 PDF")
             self._mark_completed(job_id, pdf_path)
         except asyncio.TimeoutError:
             logger.exception("Job %s timed out.", job_id)
@@ -247,6 +258,7 @@ class JobManager:
                 """
                 UPDATE jobs
                 SET status = ?, filename = ?, file_path = ?, error_message = NULL, updated_at = ?
+                    , progress_message = ?
                 WHERE job_id = ?
                 """,
                 (
@@ -254,6 +266,7 @@ class JobManager:
                     pdf_path.name,
                     str(pdf_path),
                     self._now(),
+                    "PDF 已生成，等待机器人上传",
                     job_id,
                 ),
             )
@@ -264,20 +277,68 @@ class JobManager:
                 """
                 UPDATE jobs
                 SET status = ?, error_message = ?, updated_at = ?
+                    , progress_message = ?
                 WHERE job_id = ?
                 """,
-                (JobStatus.FAILED.value, error_message, self._now(), job_id),
+                (JobStatus.FAILED.value, error_message, self._now(), error_message, job_id),
             )
 
-    def _update_status(self, job_id: str, status: JobStatus) -> None:
+    async def _run_download_with_progress(
+        self,
+        job_id: str,
+        job_dir: Path,
+        awaitable: Any,
+        progress_interval_seconds: float = 10.0,
+    ) -> Path:
+        task = asyncio.create_task(awaitable)
+        deadline = asyncio.get_running_loop().time() + self.config.job_timeout_seconds
+
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=progress_interval_seconds)
+            if done:
+                return task.result()
+
+            self._update_download_progress(job_id, job_dir)
+            if asyncio.get_running_loop().time() >= deadline:
+                task.cancel()
+                raise asyncio.TimeoutError
+
+    def _update_download_progress(self, job_id: str, job_dir: Path) -> None:
+        downloaded_files = self._count_downloaded_images(job_dir)
+        if downloaded_files > 0:
+            message = f"下载中，已保存 {downloaded_files} 张图片"
+        else:
+            message = "下载中，正在获取详情或等待图片写入"
+
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE jobs
-                SET status = ?, updated_at = ?
+                SET downloaded_files = ?, progress_message = ?, updated_at = ?
+                WHERE job_id = ? AND status = ?
+                """,
+                (downloaded_files, message, self._now(), job_id, JobStatus.DOWNLOADING.value),
+            )
+
+    def _count_downloaded_images(self, job_dir: Path) -> int:
+        images_dir = job_dir / "images"
+        if not images_dir.exists():
+            return 0
+        return sum(
+            1
+            for path in images_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in self.IMAGE_SUFFIXES and path.stat().st_size > 0
+        )
+
+    def _update_status(self, job_id: str, status: JobStatus, progress_message: str | None = None) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, progress_message = COALESCE(?, progress_message), updated_at = ?
                 WHERE job_id = ?
                 """,
-                (status.value, self._now(), job_id),
+                (status.value, progress_message, self._now(), job_id),
             )
 
     def _queued_job_ids(self) -> list[str]:
@@ -296,10 +357,18 @@ class JobManager:
         return conn
 
     @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, column_name: str, ddl: str) -> None:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if column_name not in columns:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} {ddl}")
+
+    @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         return dict(row)
-

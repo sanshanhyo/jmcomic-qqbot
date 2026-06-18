@@ -53,6 +53,7 @@ class BotSettings:
     data_dir: Path
     job_timeout_seconds: int
     poll_interval_seconds: float = 5.0
+    progress_notify_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "BotSettings":
@@ -70,6 +71,7 @@ class BotSettings:
             data_dir=Path(os.getenv("DATA_DIR", "./data")),
             job_timeout_seconds=max(1, _env_int("JOB_TIMEOUT_SECONDS", 1800)),
             poll_interval_seconds=max(1, _env_int("JOB_POLL_INTERVAL_SECONDS", 5)),
+            progress_notify_seconds=max(10, _env_int("JOB_PROGRESS_NOTIFY_SECONDS", 60)),
         )
 
 
@@ -133,6 +135,8 @@ async def monitor_job(
     backend: BackendClient,
 ) -> None:
     deadline = asyncio.get_running_loop().time() + settings.job_timeout_seconds + 60
+    last_progress_at = asyncio.get_running_loop().time()
+    last_progress_key: tuple[str | None, str | None, int] | None = None
 
     while True:
         if asyncio.get_running_loop().time() > deadline:
@@ -155,6 +159,19 @@ async def monitor_job(
         if status == "completed":
             await _download_and_upload(job, album_id, group_id, settings, napcat, backend)
             return
+
+        progress_message = job.get("progress_message")
+        downloaded_files = int(job.get("downloaded_files") or 0)
+        progress_key = (status, progress_message, downloaded_files)
+        now = asyncio.get_running_loop().time()
+        if (
+            progress_message
+            and progress_key != last_progress_key
+            and now - last_progress_at >= settings.progress_notify_seconds
+        ):
+            await _safe_send(napcat, group_id, f"JM{album_id} 进度：{progress_message}")
+            last_progress_at = now
+            last_progress_key = progress_key
 
         await asyncio.sleep(settings.poll_interval_seconds)
 

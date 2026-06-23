@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from .backend_client import BackendClient, BackendError, DuplicateJobError
-from .message_parser import ParseAction, parse_group_message, text_from_segments
+from .message_parser import (
+    ParseAction,
+    normalize_message_segments,
+    parse_group_message,
+    text_from_segments,
+)
 from .napcat_client import NapCatAPIError, NapCatClient
 
 logger = logging.getLogger(__name__)
@@ -127,6 +132,25 @@ async def handle_group_message(
     if not group_id or not user_id:
         return
 
+    segments = normalize_message_segments(event.get("message"))
+    segment_types = [str(segment.get("type")) for segment in segments[:10]]
+    at_targets = [
+        str((segment.get("data") or {}).get("qq"))
+        for segment in segments
+        if segment.get("type") == "at"
+    ]
+    message_text = text_from_segments(event.get("message"))[:120]
+    log_message = logger.info if at_targets or "JM" in message_text.upper() else logger.debug
+    log_message(
+        "Received group message group_id=%s user_id=%s segment_types=%s at_targets=%s bot_qq_id=%s text=%r",
+        group_id,
+        user_id,
+        segment_types,
+        at_targets,
+        settings.bot_qq_id,
+        message_text,
+    )
+
     now = asyncio.get_running_loop().time()
     state.cleanup(now)
     if await _handle_pending_confirmation(event, group_id, user_id, settings, state, napcat, backend, spawn_task):
@@ -136,7 +160,22 @@ async def handle_group_message(
 
     parse_result = parse_group_message(event, settings.bot_qq_id)
     if parse_result.action == ParseAction.IGNORE:
+        if at_targets:
+            logger.info(
+                "Ignored group message because it did not match this bot or command: at_targets=%s bot_qq_id=%s text=%r",
+                at_targets,
+                settings.bot_qq_id,
+                message_text,
+            )
         return
+
+    logger.info(
+        "Parsed group command action=%s album_id=%s group_id=%s user_id=%s",
+        parse_result.action,
+        parse_result.album_id,
+        group_id,
+        user_id,
+    )
 
     if parse_result.action == ParseAction.USAGE:
         await _safe_send(napcat, group_id, USAGE_MESSAGE)
@@ -150,6 +189,8 @@ async def handle_group_message(
     if album_id is None:
         await _safe_send(napcat, group_id, USAGE_MESSAGE)
         return
+
+    await _safe_send(napcat, group_id, f"收到 JM{album_id}，正在获取信息...")
 
     try:
         active = await backend.get_active_job(group_id, user_id)
@@ -457,7 +498,10 @@ async def run_bot() -> None:
 
 
 def main() -> None:
-    asyncio.run(run_bot())
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user.")
 
 
 if __name__ == "__main__":

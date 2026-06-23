@@ -168,8 +168,9 @@ async def test_handle_group_message_sends_preview_without_creating_job(tmp_path:
     assert backend.previewed == ["123456"]
     assert backend.created == []
     assert tasks.count == 0
-    assert napcat.sent[0] == ("10001", "IMAGE:https://example.test/cover.jpg")
-    assert "标题：A Test Album" in napcat.sent[1][1]
+    assert napcat.sent[0] == ("10001", "收到 JM123456，正在获取信息...")
+    assert napcat.sent[1] == ("10001", "IMAGE:https://example.test/cover.jpg")
+    assert "标题：A Test Album" in napcat.sent[2][1]
     assert ("10001", "20001") in state.pending_downloads
 
 

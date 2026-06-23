@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Any
 
 ALBUM_PATTERN = re.compile(r"(?i)\bJM\s*(\d{1,12})\b")
+CQ_CODE_PATTERN = re.compile(r"\[CQ:([a-zA-Z0-9_]+)((?:,[^\]]*)?)\]")
 
 
 class ParseAction(StrEnum):
@@ -22,10 +23,53 @@ class ParseResult:
     error_message: str | None = None
 
 
+def _decode_cq_value(value: str) -> str:
+    return (
+        value.replace("&#91;", "[")
+        .replace("&#93;", "]")
+        .replace("&#44;", ",")
+        .replace("&amp;", "&")
+    )
+
+
+def _parse_cq_data(raw_data: str) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if not raw_data:
+        return data
+    for item in raw_data.lstrip(",").split(","):
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        data[key] = _decode_cq_value(value)
+    return data
+
+
+def normalize_message_segments(message_segments: Any) -> list[dict[str, Any]]:
+    if isinstance(message_segments, list):
+        return [segment for segment in message_segments if isinstance(segment, dict)]
+    if not isinstance(message_segments, str):
+        return []
+
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+    for match in CQ_CODE_PATTERN.finditer(message_segments):
+        if match.start() > cursor:
+            text = _decode_cq_value(message_segments[cursor : match.start()])
+            if text:
+                segments.append({"type": "text", "data": {"text": text}})
+        segment_type = match.group(1)
+        segments.append({"type": segment_type, "data": _parse_cq_data(match.group(2))})
+        cursor = match.end()
+
+    if cursor < len(message_segments):
+        text = _decode_cq_value(message_segments[cursor:])
+        if text:
+            segments.append({"type": "text", "data": {"text": text}})
+    return segments
+
+
 def has_at_bot(message_segments: Any, bot_qq_id: str) -> bool:
-    if not isinstance(message_segments, list):
-        return False
-    for segment in message_segments:
+    for segment in normalize_message_segments(message_segments):
         if not isinstance(segment, dict):
             continue
         if segment.get("type") != "at":
@@ -37,13 +81,8 @@ def has_at_bot(message_segments: Any, bot_qq_id: str) -> bool:
 
 
 def text_from_segments(message_segments: Any) -> str:
-    if not isinstance(message_segments, list):
-        return ""
-
     parts: list[str] = []
-    for segment in message_segments:
-        if not isinstance(segment, dict):
-            continue
+    for segment in normalize_message_segments(message_segments):
         if segment.get("type") != "text":
             continue
         data = segment.get("data") or {}

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 USAGE_MESSAGE = "用法：@机器人 JM123456"
 ILLEGAL_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 CONFIRM_WORDS = {"下载", "确认", "同意", "是", "要", "y", "yes", "ok"}
-CANCEL_WORDS = {"取消", "不要", "否", "不下", "n", "no"}
+CANCEL_WORDS = {"取消", "取消下载", "取消任务", "不要", "否", "不下", "n", "no"}
 ACTIVE_CANCEL_WORDS = CANCEL_WORDS | {"取消下载", "取消任务", "停止下载", "停止任务"}
 
 
@@ -88,16 +88,9 @@ class PendingDownload:
     expires_at: float
 
 
-@dataclass(frozen=True)
-class ActiveDownload:
-    job_id: str
-    album_id: str
-
-
 @dataclass
 class BotState:
     pending_downloads: dict[tuple[str, str], PendingDownload] = field(default_factory=dict)
-    active_downloads: dict[tuple[str, str], ActiveDownload] = field(default_factory=dict)
 
     def cleanup(self, now: float) -> None:
         expired = [
@@ -137,7 +130,7 @@ async def handle_group_message(
     state.cleanup(now)
     if await _handle_pending_confirmation(event, group_id, user_id, settings, state, napcat, backend, spawn_task):
         return
-    if await _handle_active_cancel(event, group_id, user_id, state, napcat, backend):
+    if await _handle_active_cancel(event, group_id, user_id, napcat, backend):
         return
 
     parse_result = parse_group_message(event, settings.bot_qq_id)
@@ -157,12 +150,18 @@ async def handle_group_message(
         await _safe_send(napcat, group_id, USAGE_MESSAGE)
         return
 
-    active = state.active_downloads.get((group_id, user_id))
+    try:
+        active = await backend.get_active_job(group_id, user_id)
+    except BackendError:
+        logger.exception("Could not query active job for group=%s user=%s.", group_id, user_id)
+        await _safe_send(napcat, group_id, "后端暂不可用，请稍后再试")
+        return
+
     if active is not None:
         await _safe_send(
             napcat,
             group_id,
-            f"你已有 JM{active.album_id} 正在下载或等待上传，回复“取消下载”可以停止当前任务。",
+            f"你已有 JM{active.get('album_id')} 正在下载或排队中，回复“取消下载”可以停止当前任务。",
         )
         return
 
@@ -202,7 +201,6 @@ async def _handle_pending_confirmation(
         group_id,
         user_id,
         settings,
-        state,
         napcat,
         backend,
         spawn_task,
@@ -215,28 +213,25 @@ async def _handle_active_cancel(
     event: dict[str, Any],
     group_id: str,
     user_id: str,
-    state: BotState,
     napcat: NapCatClient,
     backend: BackendClient,
 ) -> bool:
-    key = (group_id, user_id)
-    active = state.active_downloads.get(key)
-    if active is None:
-        return False
-
     text = text_from_segments(event.get("message")).strip().lower()
     if text not in ACTIVE_CANCEL_WORDS:
         return False
 
     try:
-        await backend.cancel_job(active.job_id)
+        cancelled = await backend.cancel_active_job(group_id, user_id)
     except BackendError:
-        logger.exception("Could not cancel job %s.", active.job_id)
-        await _safe_send(napcat, group_id, f"JM{active.album_id} 取消失败，请稍后再试")
+        logger.exception("Could not cancel active job for group=%s user=%s.", group_id, user_id)
+        await _safe_send(napcat, group_id, "取消失败，请稍后再试")
         return True
 
-    state.active_downloads.pop(key, None)
-    await _safe_send(napcat, group_id, f"已取消 JM{active.album_id} 任务。")
+    if cancelled is None:
+        await _safe_send(napcat, group_id, "你没有正在进行的任务。")
+        return True
+
+    await _safe_send(napcat, group_id, f"已取消 JM{cancelled.get('album_id')} 任务。")
     return True
 
 
@@ -292,7 +287,6 @@ async def _create_job_and_monitor(
     group_id: str,
     user_id: str,
     settings: BotSettings,
-    state: BotState,
     napcat: NapCatClient,
     backend: BackendClient,
     spawn_task: Callable[[Awaitable[None]], None],
@@ -314,27 +308,7 @@ async def _create_job_and_monitor(
     if extra_message:
         message = f"{message}\n{extra_message}"
     await _safe_send(napcat, group_id, message)
-    key = (group_id, user_id)
-    state.active_downloads[key] = ActiveDownload(job_id=job_id, album_id=album_id)
-    spawn_task(_monitor_job_and_cleanup(job_id, album_id, group_id, key, settings, state, napcat, backend))
-
-
-async def _monitor_job_and_cleanup(
-    job_id: str,
-    album_id: str,
-    group_id: str,
-    active_key: tuple[str, str],
-    settings: BotSettings,
-    state: BotState,
-    napcat: NapCatClient,
-    backend: BackendClient,
-) -> None:
-    try:
-        await monitor_job(job_id, album_id, group_id, settings, napcat, backend)
-    finally:
-        active = state.active_downloads.get(active_key)
-        if active is not None and active.job_id == job_id:
-            state.active_downloads.pop(active_key, None)
+    spawn_task(monitor_job(job_id, album_id, group_id, settings, napcat, backend))
 
 
 async def monitor_job(
@@ -345,15 +319,10 @@ async def monitor_job(
     napcat: NapCatClient,
     backend: BackendClient,
 ) -> None:
-    deadline = asyncio.get_running_loop().time() + settings.job_timeout_seconds + 60
     last_progress_at = asyncio.get_running_loop().time()
     last_progress_key: tuple[str | None, str | None, int] | None = None
 
     while True:
-        if asyncio.get_running_loop().time() > deadline:
-            await _safe_send(napcat, group_id, f"JM{album_id} 任务轮询超时，请稍后查看")
-            return
-
         try:
             job = await backend.get_job(job_id)
         except BackendError:

@@ -6,7 +6,7 @@ from typing import Awaitable
 
 import pytest
 
-from bot.main import ActiveDownload, BotSettings, BotState, _download_and_upload, handle_group_message
+from bot.main import BotSettings, BotState, _download_and_upload, handle_group_message
 from bot.napcat_client import NapCatAPIError
 
 
@@ -38,6 +38,17 @@ class FakeCreateBackend:
         self.created: list[tuple[str, str, str]] = []
         self.previewed: list[str] = []
         self.cancelled: list[str] = []
+        self.active_queries: list[tuple[str, str]] = []
+        self.cancelled_active: list[tuple[str, str]] = []
+        self.active_job: dict | None = None
+
+    async def get_active_job(self, group_id: str, user_id: str) -> dict | None:
+        self.active_queries.append((group_id, user_id))
+        return self.active_job
+
+    async def cancel_active_job(self, group_id: str, user_id: str) -> dict | None:
+        self.cancelled_active.append((group_id, user_id))
+        return self.active_job
 
     async def get_album_preview(self, album_id: str) -> dict:
         self.previewed.append(album_id)
@@ -187,11 +198,8 @@ async def test_confirm_download_creates_job(tmp_path: Path) -> None:
 async def test_new_jm_is_rejected_when_user_has_active_download(tmp_path: Path) -> None:
     napcat = FakeNapCat()
     backend = FakeCreateBackend()
-    state = BotState(
-        active_downloads={
-            ("10001", "20001"): ActiveDownload(job_id="job-123", album_id="123456")
-        }
-    )
+    backend.active_job = {"job_id": "job-123", "album_id": "123456", "status": "downloading"}
+    state = BotState()
 
     await handle_group_message(
         _group_event(
@@ -210,7 +218,7 @@ async def test_new_jm_is_rejected_when_user_has_active_download(tmp_path: Path) 
     assert backend.previewed == []
     assert napcat.sent[-1] == (
         "10001",
-        "你已有 JM123456 正在下载或等待上传，回复“取消下载”可以停止当前任务。",
+        "你已有 JM123456 正在下载或排队中，回复“取消下载”可以停止当前任务。",
     )
 
 
@@ -218,11 +226,8 @@ async def test_new_jm_is_rejected_when_user_has_active_download(tmp_path: Path) 
 async def test_active_download_can_be_cancelled(tmp_path: Path) -> None:
     napcat = FakeNapCat()
     backend = FakeCreateBackend()
-    state = BotState(
-        active_downloads={
-            ("10001", "20001"): ActiveDownload(job_id="job-123", album_id="123456")
-        }
-    )
+    backend.active_job = {"job_id": "job-123", "album_id": "123456", "status": "downloading"}
+    state = BotState()
 
     await handle_group_message(
         _group_event([{"type": "text", "data": {"text": "取消下载"}}]),
@@ -233,8 +238,7 @@ async def test_active_download_can_be_cancelled(tmp_path: Path) -> None:
         TaskCollector(),
     )
 
-    assert backend.cancelled == ["job-123"]
-    assert state.active_downloads == {}
+    assert backend.cancelled_active == [("10001", "20001")]
     assert napcat.sent[-1] == ("10001", "已取消 JM123456 任务。")
 
 

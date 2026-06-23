@@ -11,6 +11,7 @@
 - 支持 `JM123456`、`jm123456` 两种输入；纯数字不会触发下载。
 - 一条消息只允许一个编号。
 - 先发送封面和标题预览，用户回复确认后才加入下载队列。
+- 同一群内同一用户同时只能有一个排队中、下载中或转换中的任务。
 - 下载任务写入 SQLite，服务重启后不会只依赖内存状态。
 - JMComic 下载和 PDF 导出在独立子进程执行，总超时或长时间无文件写入都会终止子进程，避免单个卡死任务堵住队列。
 - 下载完成后调用 NapCatQQ `upload_group_file` 上传 PDF。
@@ -208,6 +209,8 @@ PDF 生成后会校验：
 取消下载
 ```
 
+取消会按“群号 + 用户 QQ”在后端查询当前任务，所以 Bot 重启后仍然可以取消排队中或下载中的任务。
+
 任务完成后，机器人会上传 PDF 并发送完成消息。
 
 ## 如何测试
@@ -325,8 +328,10 @@ Invoke-RestMethod `
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/api/albums/{album_id}/preview` | 获取漫画封面、标题、页数和预计时间 |
 | `POST` | `/api/jobs` | 创建下载任务 |
+| `GET` | `/api/jobs/active?group_id=...&user_id=...` | 查询某个群用户当前活跃任务 |
+| `POST` | `/api/jobs/active/cancel?group_id=...&user_id=...` | 取消某个群用户当前活跃任务 |
 | `GET` | `/api/jobs/{job_id}` | 查询任务状态 |
-| `POST` | `/api/jobs/{job_id}/cancel` | 取消排队中或下载中的任务 |
+| `POST` | `/api/jobs/{job_id}/cancel` | 按任务编号取消排队中或下载中的任务 |
 | `GET` | `/api/jobs/{job_id}/file` | 下载 PDF |
 
 任务状态：

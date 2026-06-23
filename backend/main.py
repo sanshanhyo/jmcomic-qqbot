@@ -146,7 +146,7 @@ async def create_job(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
-                "message": "该 JM 编号已有进行中的任务",
+                "message": "你已有进行中的任务，或该 JM 编号已在本群下载中",
                 "job_id": existing["job_id"],
                 "status": existing["status"],
             },
@@ -267,6 +267,38 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     except ProcessLookupError:
         return
     await process.wait()
+
+
+@app.get("/api/jobs/active", response_model=JobResponse)
+async def get_active_job(
+    group_id: str,
+    user_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JobResponse:
+    _require_api_token(request, authorization)
+    if not group_id.isdigit() or not user_id.isdigit():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid group_id or user_id")
+    job = _manager(request).find_active_job_for_user(group_id, user_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="active job not found")
+    return JobResponse(**job)
+
+
+@app.post("/api/jobs/active/cancel", response_model=JobResponse)
+async def cancel_active_job(
+    group_id: str,
+    user_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> JobResponse:
+    _require_api_token(request, authorization)
+    if not group_id.isdigit() or not user_id.isdigit():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid group_id or user_id")
+    job = await _manager(request).cancel_active_job_for_user(group_id, user_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="active job not found")
+    return JobResponse(**job)
 
 
 @app.get("/api/jobs/{job_id}", response_model=JobResponse)

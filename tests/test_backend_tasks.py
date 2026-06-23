@@ -8,7 +8,7 @@ import pytest
 
 from backend import downloader
 from backend.models import JobStatus
-from backend.task_manager import JobManager, JobManagerConfig
+from backend.task_manager import DuplicateJobError, JobManager, JobManagerConfig
 
 
 @pytest.mark.asyncio
@@ -95,7 +95,7 @@ async def test_stuck_download_times_out_and_worker_continues(
     await manager.start()
     try:
         stuck = await manager.create_job("111111", "10001", "20001")
-        next_job = await manager.create_job("222222", "10001", "20001")
+        next_job = await manager.create_job("222222", "10001", "20002")
         await asyncio.wait_for(manager.join(), timeout=8)
         stuck_stored = manager.get_job(stuck["job_id"])
         next_stored = manager.get_job(next_job["job_id"])
@@ -191,6 +191,52 @@ async def test_cancel_job_terminates_active_process(
     assert stored is not None
     assert stored["status"] == JobStatus.FAILED.value
     assert stored["error_message"] == "任务已取消"
+
+
+@pytest.mark.asyncio
+async def test_same_user_active_job_is_rejected(tmp_path: Path) -> None:
+    manager = JobManager(
+        JobManagerConfig(
+            data_dir=tmp_path / "data",
+            option_path=tmp_path / "jmcomic-option.yml",
+            max_concurrent_jobs=1,
+            job_timeout_seconds=5,
+        )
+    )
+    manager.initialize()
+
+    first = await manager.create_job("111111", "10001", "20001")
+
+    with pytest.raises(DuplicateJobError) as exc_info:
+        await manager.create_job("222222", "10001", "20001")
+
+    other_user = await manager.create_job("333333", "10001", "20002")
+
+    assert exc_info.value.existing_job["job_id"] == first["job_id"]
+    assert other_user["album_id"] == "333333"
+
+
+@pytest.mark.asyncio
+async def test_cancel_active_job_for_user_marks_failed(tmp_path: Path) -> None:
+    manager = JobManager(
+        JobManagerConfig(
+            data_dir=tmp_path / "data",
+            option_path=tmp_path / "jmcomic-option.yml",
+            max_concurrent_jobs=1,
+            job_timeout_seconds=5,
+        )
+    )
+    manager.initialize()
+
+    job = await manager.create_job("111111", "10001", "20001")
+    cancelled = await manager.cancel_active_job_for_user("10001", "20001")
+    stored = manager.get_job(job["job_id"])
+
+    assert cancelled is not None
+    assert stored is not None
+    assert stored["status"] == JobStatus.FAILED.value
+    assert stored["error_message"] == "任务已取消"
+    assert manager.find_active_job_for_user("10001", "20001") is None
 
 
 def test_pdf_not_generated_raises(tmp_path: Path) -> None:

@@ -73,6 +73,34 @@ class BackendClient:
             raise BackendError("后端取消任务失败") from exc
         return response.json()
 
+    async def get_active_job(self, group_id: str, user_id: str) -> dict[str, Any] | None:
+        try:
+            response = await self._client.get(
+                "/api/jobs/active",
+                params={"group_id": group_id, "user_id": user_id},
+                headers=self._headers(),
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise BackendError("后端查询当前任务失败") from exc
+        return response.json()
+
+    async def cancel_active_job(self, group_id: str, user_id: str) -> dict[str, Any] | None:
+        try:
+            response = await self._client.post(
+                "/api/jobs/active/cancel",
+                params={"group_id": group_id, "user_id": user_id},
+                headers=self._headers(),
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise BackendError("后端取消当前任务失败") from exc
+        return response.json()
+
     async def get_album_preview(self, album_id: str) -> dict[str, Any]:
         try:
             response = await self._client.get(f"/api/albums/{album_id}/preview", headers=self._headers())

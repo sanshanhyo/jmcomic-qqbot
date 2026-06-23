@@ -126,7 +126,9 @@ class JobManager:
         await self._queue.join()
 
     async def create_job(self, album_id: str, group_id: str, user_id: str) -> dict[str, Any]:
-        existing = self.find_active_job(album_id, group_id)
+        existing = self.find_active_job_for_user(group_id, user_id)
+        if existing is None:
+            existing = self.find_active_job(album_id, group_id)
         if existing is not None:
             raise DuplicateJobError(existing)
 
@@ -165,6 +167,17 @@ class JobManager:
         if created is None:
             raise RuntimeError("created job disappeared")
         return created
+
+    async def cancel_active_job_for_user(
+        self,
+        group_id: str,
+        user_id: str,
+        reason: str = "任务已取消",
+    ) -> dict[str, Any] | None:
+        job = self.find_active_job_for_user(group_id, user_id)
+        if job is None:
+            return None
+        return await self.cancel_job(str(job["job_id"]), reason)
 
     async def cancel_job(self, job_id: str, reason: str = "任务已取消") -> dict[str, Any] | None:
         job = self.get_job(job_id)
@@ -210,6 +223,30 @@ class JobManager:
         if not path.is_file() or not path.is_relative_to(self.jobs_dir.resolve()):
             return None
         return path, filename
+
+    def find_active_job_for_user(self, group_id: str, user_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT job_id, album_id, group_id, user_id, status,
+                       filename, file_path, error_message, downloaded_files,
+                       progress_message, created_at, updated_at
+                FROM jobs
+                WHERE group_id = ?
+                  AND user_id = ?
+                  AND status IN (?, ?, ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (
+                    group_id,
+                    user_id,
+                    JobStatus.QUEUED.value,
+                    JobStatus.DOWNLOADING.value,
+                    JobStatus.CONVERTING.value,
+                ),
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
 
     def find_active_job(self, album_id: str, group_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:

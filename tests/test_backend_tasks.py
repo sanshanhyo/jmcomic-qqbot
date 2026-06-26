@@ -384,6 +384,24 @@ def test_download_threading_env_override(monkeypatch: pytest.MonkeyPatch) -> Non
 
     downloader._set_download_threading(option)
 
+    assert option.download.threading.image == 16
+    assert option.download.threading.photo == 4
+
+
+def test_download_threading_cap_can_be_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    option = SimpleNamespace(
+        download=SimpleNamespace(
+            threading=SimpleNamespace(image=20, photo=4),
+        ),
+    )
+
+    monkeypatch.setenv("JM_DOWNLOAD_IMAGE_THREADS", "40")
+    monkeypatch.setenv("JM_DOWNLOAD_PHOTO_THREADS", "8")
+    monkeypatch.setenv("JM_DOWNLOAD_MAX_IMAGE_THREADS", "40")
+    monkeypatch.setenv("JM_DOWNLOAD_MAX_PHOTO_THREADS", "8")
+
+    downloader._set_download_threading(option)
+
     assert option.download.threading.image == 40
     assert option.download.threading.photo == 8
 

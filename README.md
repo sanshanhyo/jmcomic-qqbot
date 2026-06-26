@@ -91,8 +91,10 @@ CACHE_CLEANUP_INTERVAL_SECONDS=3600
 JOB_CACHE_TTL_SECONDS=259200
 BOT_DOWNLOAD_CACHE_TTL_SECONDS=259200
 PREVIEW_CACHE_TTL_SECONDS=86400
-JM_DOWNLOAD_IMAGE_THREADS=40
-JM_DOWNLOAD_PHOTO_THREADS=8
+JM_DOWNLOAD_IMAGE_THREADS=16
+JM_DOWNLOAD_PHOTO_THREADS=4
+JM_DOWNLOAD_MAX_IMAGE_THREADS=16
+JM_DOWNLOAD_MAX_PHOTO_THREADS=4
 JMCOMIC_OPTION_PATH=./config/jmcomic-option.yml
 DATA_DIR=./data
 ```
@@ -123,8 +125,10 @@ DATA_DIR=./data
 | `JOB_CACHE_TTL_SECONDS` | 已完成/已失败任务目录保留时间，默认 `259200` 秒，即 3 天 |
 | `BOT_DOWNLOAD_CACHE_TTL_SECONDS` | Bot 下载到本地准备上传的 PDF 缓存保留时间，默认 3 天 |
 | `PREVIEW_CACHE_TTL_SECONDS` | 漫画预览临时文件保留时间，默认 `86400` 秒，即 1 天 |
-| `JM_DOWNLOAD_IMAGE_THREADS` | JMComic 图片下载线程数，留空则使用 `config/jmcomic-option.yml` |
-| `JM_DOWNLOAD_PHOTO_THREADS` | JMComic 章节下载线程数，留空则使用 `config/jmcomic-option.yml` |
+| `JM_DOWNLOAD_IMAGE_THREADS` | JMComic 图片下载线程数，默认建议 `16` |
+| `JM_DOWNLOAD_PHOTO_THREADS` | JMComic 章节下载线程数，默认建议 `4` |
+| `JM_DOWNLOAD_MAX_IMAGE_THREADS` | 图片下载线程硬上限，默认 `16`，防止小服务器被过高并发拖死 |
+| `JM_DOWNLOAD_MAX_PHOTO_THREADS` | 章节下载线程硬上限，默认 `4` |
 | `JMCOMIC_OPTION_PATH` | JMComic 配置文件路径 |
 | `DATA_DIR` | 数据目录 |
 
@@ -181,7 +185,7 @@ download:
     photo: 4
 ```
 
-`download.threading.image` 和 `download.threading.photo` 可以影响下载并发。也可以在 `.env` 里用 `JM_DOWNLOAD_IMAGE_THREADS` 和 `JM_DOWNLOAD_PHOTO_THREADS` 覆盖它们，服务器建议先从 `40` 和 `8` 开始试。数值越大不一定越快，过高可能触发限流；如果出现 403、频繁超时或下载卡住，就把这两个值降下来。后端只在 `backend/downloader.py` 中调用 `jmcomic`。
+`download.threading.image` 和 `download.threading.photo` 可以影响下载并发。也可以在 `.env` 里用 `JM_DOWNLOAD_IMAGE_THREADS` 和 `JM_DOWNLOAD_PHOTO_THREADS` 覆盖它们，服务器建议先从 `16` 和 `4` 开始试。数值越大不一定越快，过高可能触发限流、CPU/IO 飙升，甚至让 SSH 都响应变慢。后端会再用 `JM_DOWNLOAD_MAX_IMAGE_THREADS` 和 `JM_DOWNLOAD_MAX_PHOTO_THREADS` 做硬上限，避免误填过高并发把小服务器拖死。后端只在 `backend/downloader.py` 中调用 `jmcomic`。
 
 每个任务会使用独立目录：
 

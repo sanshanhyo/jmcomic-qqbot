@@ -19,6 +19,8 @@ COOKIE_LOG_RE = re.compile(
     r"(cookies['\"]?\s*:\s*['\"]?)([^'\"\]}]+)|"
     r"(AVS['\"]?\s*:\s*['\"]?)([^'\"\]}]+)"
 )
+DEFAULT_MAX_IMAGE_THREADS = 16
+DEFAULT_MAX_PHOTO_THREADS = 4
 
 
 class DownloaderError(Exception):
@@ -336,14 +338,13 @@ def _env_positive_int(name: str) -> int | None:
 def _set_download_threading(option: object) -> None:
     image_threads = _env_positive_int("JM_DOWNLOAD_IMAGE_THREADS")
     photo_threads = _env_positive_int("JM_DOWNLOAD_PHOTO_THREADS")
-    if image_threads is None and photo_threads is None:
-        return
 
     try:
         if image_threads is not None:
             option.download.threading.image = image_threads
         if photo_threads is not None:
             option.download.threading.photo = photo_threads
+        _cap_download_threading(option)
         logger.info(
             "Using JMComic download threading: image=%s, photo=%s",
             option.download.threading.image,
@@ -351,6 +352,20 @@ def _set_download_threading(option: object) -> None:
         )
     except Exception:
         logger.warning("Could not override jmcomic download threading; using option file values.")
+
+
+def _cap_download_threading(option: object) -> None:
+    image_cap = _env_positive_int("JM_DOWNLOAD_MAX_IMAGE_THREADS") or DEFAULT_MAX_IMAGE_THREADS
+    photo_cap = _env_positive_int("JM_DOWNLOAD_MAX_PHOTO_THREADS") or DEFAULT_MAX_PHOTO_THREADS
+
+    current_image = _positive_int_or_none(getattr(option.download.threading, "image", None))
+    current_photo = _positive_int_or_none(getattr(option.download.threading, "photo", None))
+    if current_image is not None and current_image > image_cap:
+        logger.warning("Capping JM_DOWNLOAD image threads from %s to %s.", current_image, image_cap)
+        option.download.threading.image = image_cap
+    if current_photo is not None and current_photo > photo_cap:
+        logger.warning("Capping JM_DOWNLOAD photo threads from %s to %s.", current_photo, photo_cap)
+        option.download.threading.photo = photo_cap
 
 
 def download_album_pdf(album_id: str, option_path: str | Path, job_dir: str | Path) -> Path:

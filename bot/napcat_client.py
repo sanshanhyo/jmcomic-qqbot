@@ -81,10 +81,12 @@ class NapCatClient:
                     self.reconnect_seconds,
                 )
                 await asyncio.sleep(self.reconnect_seconds)
-            except (InvalidHandshake, OSError, WebSocketException):
-                logger.exception(
-                    "NapCat WebSocket %s is unavailable; reconnecting in %.1f seconds.",
+            except (InvalidHandshake, OSError, WebSocketException) as exc:
+                logger.warning(
+                    "NapCat WebSocket %s is unavailable (%s: %s); reconnecting in %.1f seconds.",
                     self.ws_url,
+                    exc.__class__.__name__,
+                    exc,
                     self.reconnect_seconds,
                 )
                 await asyncio.sleep(self.reconnect_seconds)

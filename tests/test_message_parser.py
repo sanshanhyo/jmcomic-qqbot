@@ -81,3 +81,48 @@ def test_plain_number_requires_jm_prefix() -> None:
     )
 
     assert result.action == ParseAction.USAGE
+
+
+def test_parse_search_command_with_at() -> None:
+    result = parse_group_message(
+        _event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 搜索 戦乙女"}},
+            ]
+        ),
+        bot_qq_id="12345",
+    )
+
+    assert result.action == ParseAction.SEARCH
+    assert result.search_query == "戦乙女"
+
+
+def test_search_command_does_not_become_jm_download() -> None:
+    result = parse_group_message(
+        _event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 搜索 JM123456"}},
+            ]
+        ),
+        bot_qq_id="12345",
+    )
+
+    assert result.action == ParseAction.SEARCH
+    assert result.search_query == "JM123456"
+
+
+def test_search_without_query_returns_usage_error() -> None:
+    result = parse_group_message(
+        _event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 搜索 "}},
+            ]
+        ),
+        bot_qq_id="12345",
+    )
+
+    assert result.action == ParseAction.ERROR
+    assert result.error_key == "search_usage"

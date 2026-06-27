@@ -9,10 +9,13 @@
 - 只处理 QQ 群消息。
 - 使用 OneBot 11 结构化消息段判断是否真的 `@` 了机器人。
 - 支持 `JM123456`、`jm123456` 两种输入；纯数字不会触发下载。
+- 可选开启关键词搜索：`@机器人 搜索 关键词`，用户回复序号后进入同一套预览确认流程。
 - 一条消息只允许一个编号。
 - 先发送封面和标题预览，用户回复确认后才加入下载队列。
 - 如果预览检测到页数超过阈值，用户需要二次确认后才会开始下载。
 - 同一群内同一用户同时只能有一个排队中、下载中或转换中的任务。
+- 每个用户默认最多 1 个活跃任务，每个群默认最多 3 个活跃任务。
+- 群主、群管理员和机器人管理者可以查询状态、队列和取消任务；清理缓存只允许机器人管理者执行。
 - 下载任务写入 SQLite，服务重启后不会只依赖内存状态。
 - 后端控制台会显示下载进度条；如果预览拿到了页数，会显示百分比和 `已下载/总页数`。
 - 群内只发送关键状态，不会按“已保存 N 张图片”频繁刷屏。
@@ -20,9 +23,9 @@
 - JMComic 下载和 PDF 导出在独立子进程执行，总超时或长时间无文件写入都会终止子进程，避免单个卡死任务堵住队列。
 - PDF 文件会命名为 `[JM编号]漫画标题.pdf`，并自动清理 Windows 不允许的字符。
 - 下载完成后调用 NapCatQQ `upload_group_file` 上传 PDF。
-- PDF 过大时会自动拆分为多个分卷 PDF 上传，分卷文件名以 `part01-of03_` 开头，方便在 QQ 群文件列表里识别。
-- 上传失败最多重试 3 次。
-- 后端会定期清理过期缓存，避免 `data/` 目录无限增长。
+- PDF 过大时会自动拆分为多个分卷 PDF 上传，分卷文件名使用 `JM123456_part01-of03.pdf`，方便在 QQ 群文件列表里识别。
+- 上传失败会按配置重试，默认最多重试 5 次。
+- 后端会定期清理过期缓存；Bot 上传成功后也会清理本次上传缓存，避免 `data/` 目录无限增长。
 - Bot 群内文案集中放在 `lang/zh_CN.json`，后续维护提示语不用翻代码。
 - Token、Cookie 和登录信息都通过本地配置提供，不写死在代码里。
 
@@ -76,16 +79,26 @@ NAPCAT_ACCESS_TOKEN=
 NAPCAT_HTTP_TIMEOUT_SECONDS=60
 NAPCAT_UPLOAD_TIMEOUT_SECONDS=900
 NAPCAT_MAX_UPLOAD_BYTES=104857600
+NAPCAT_MAX_UPLOAD_FILENAME_BYTES=96
+NAPCAT_UPLOAD_RETRIES=5
 BOT_LANG=zh_CN
+BOT_MANAGER_QQ_IDS=
 BACKEND_URL=http://127.0.0.1:8000
 BACKEND_API_TOKEN=
+ENABLE_SEARCH=false
+SEARCH_TIMEOUT_SECONDS=20
+SEARCH_RESULT_LIMIT=5
+SEARCH_CONFIRM_TIMEOUT_SECONDS=600
 MAX_CONCURRENT_JOBS=1
+MAX_ACTIVE_JOBS_PER_GROUP=3
+MAX_ACTIVE_JOBS_PER_USER=1
 JOB_TIMEOUT_SECONDS=1800
 JOB_STALL_TIMEOUT_SECONDS=300
 JOB_PROGRESS_CHECK_SECONDS=10
 PREVIEW_TIMEOUT_SECONDS=30
 JOB_PROGRESS_NOTIFY_SECONDS=300
-JOB_CONFIRM_TIMEOUT_SECONDS=300
+JOB_CONFIRM_TIMEOUT_SECONDS=600
+USER_COMMAND_COOLDOWN_SECONDS=10
 LARGE_ALBUM_WARNING_PAGES=100
 CACHE_CLEANUP_INTERVAL_SECONDS=3600
 JOB_CACHE_TTL_SECONDS=259200
@@ -110,16 +123,26 @@ DATA_DIR=./data
 | `NAPCAT_HTTP_TIMEOUT_SECONDS` | NapCatQQ 普通 HTTP API 超时，默认 `60` 秒 |
 | `NAPCAT_UPLOAD_TIMEOUT_SECONDS` | NapCatQQ 上传群文件超时，默认 `900` 秒；大 PDF 建议保持较大 |
 | `NAPCAT_MAX_UPLOAD_BYTES` | 单个上传文件大小上限，超过会自动拆分 PDF；默认 `104857600`，即 100MB |
+| `NAPCAT_MAX_UPLOAD_FILENAME_BYTES` | 上传到 QQ 群文件时使用的展示文件名字节上限，默认 `96` |
+| `NAPCAT_UPLOAD_RETRIES` | 单个文件上传失败后的重试次数，默认 `5` |
 | `BOT_LANG` | Bot 群内提示语言文件，默认 `zh_CN`，对应 `lang/zh_CN.json` |
+| `BOT_MANAGER_QQ_IDS` | 机器人管理者 QQ 号，多个用英文逗号分隔；管理者可执行清理缓存等维护命令 |
 | `BACKEND_URL` | 后端 FastAPI 地址 |
 | `BACKEND_API_TOKEN` | 后端 API token，没有则留空 |
+| `ENABLE_SEARCH` | 是否启用关键词搜索，默认 `false`；启用后 Bot 和后端都会处理搜索 |
+| `SEARCH_TIMEOUT_SECONDS` | 后端搜索子进程超时时间，默认 `20` 秒 |
+| `SEARCH_RESULT_LIMIT` | 每次搜索返回结果数，默认 `5`，最大 `10` |
+| `SEARCH_CONFIRM_TIMEOUT_SECONDS` | 搜索结果出来后等待用户回复序号的时间，默认 `600` 秒 |
 | `MAX_CONCURRENT_JOBS` | 同时下载任务数，默认 `1` |
+| `MAX_ACTIVE_JOBS_PER_GROUP` | 每个群允许同时存在的活跃任务数，默认 `3` |
+| `MAX_ACTIVE_JOBS_PER_USER` | 每个用户允许同时存在的活跃任务数，默认 `1` |
 | `JOB_TIMEOUT_SECONDS` | 单个任务总超时时间，默认 `1800` 秒 |
 | `JOB_STALL_TIMEOUT_SECONDS` | 下载子进程无文件变化的卡住超时，默认 `300` 秒；设为 `0` 可关闭 |
 | `JOB_PROGRESS_CHECK_SECONDS` | 后端检查下载进度和卡住状态的间隔，默认 `10` 秒 |
 | `PREVIEW_TIMEOUT_SECONDS` | 获取漫画封面和标题的超时时间，默认 `30` 秒 |
 | `JOB_PROGRESS_NOTIFY_SECONDS` | 群内非下载阶段进度通知间隔，默认 `300` 秒；后端控制台进度条不受影响 |
-| `JOB_CONFIRM_TIMEOUT_SECONDS` | 预览后等待用户确认的时间，默认 `300` 秒 |
+| `JOB_CONFIRM_TIMEOUT_SECONDS` | 预览后等待用户确认的时间，默认 `600` 秒 |
+| `USER_COMMAND_COOLDOWN_SECONDS` | 同一群同一用户发送新任务或搜索命令的冷却时间，默认 `10` 秒 |
 | `LARGE_ALBUM_WARNING_PAGES` | 超过多少页触发二次确认，默认 `100`；设为 `0` 可关闭 |
 | `CACHE_CLEANUP_INTERVAL_SECONDS` | 后端缓存清理间隔，默认 `3600` 秒；设为 `0` 可关闭 |
 | `JOB_CACHE_TTL_SECONDS` | 已完成/已失败任务目录保留时间，默认 `259200` 秒，即 3 天 |
@@ -221,6 +244,14 @@ PDF 生成后会校验：
 @机器人 JM123456
 ```
 
+如果开启了 `ENABLE_SEARCH=true`，也可以搜索关键词：
+
+```text
+@机器人 搜索 戦乙女
+```
+
+机器人会返回最多 `SEARCH_RESULT_LIMIT` 条结果。用户回复序号后，机器人会继续发送封面、标题、页数和预计时间，并询问是否下载；不会直接加入下载队列。
+
 没有编号时，机器人会回复：
 
 ```text
@@ -249,6 +280,18 @@ PDF 生成后会校验：
 
 取消会按“群号 + 用户 QQ”在后端查询当前任务，所以 Bot 重启后仍然可以取消排队中或下载中的任务。
 
+管理员命令需要 `@机器人`：
+
+```text
+@机器人 状态
+@机器人 队列
+@机器人 取消 JM123456
+@机器人 取消 任务编号前几位
+@机器人 清理缓存
+```
+
+`状态`、`队列`、`取消` 允许 QQ 群主、QQ群管理员、机器人管理者执行。`清理缓存` 只允许机器人管理者执行。机器人管理者由部署者在 `.env` 的 `BOT_MANAGER_QQ_IDS` 中配置，不等同于 QQ 群管理员。
+
 任务完成后，机器人会上传 PDF 并发送完成消息。
 
 ## 如何测试
@@ -271,6 +314,11 @@ PDF 生成后会校验：
 - PDF 未生成
 - 上传成功
 - 上传失败重试
+- 搜索命令解析
+- 搜索结果选择后进入预览确认
+- 管理员命令权限
+- 每群/每用户活跃任务限制
+- 上传阶段管理员取消
 
 ### 2. 测后端是否能启动
 
@@ -381,12 +429,17 @@ Invoke-RestMethod `
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/api/albums/{album_id}/preview` | 获取漫画封面、标题、页数和预计时间 |
+| `POST` | `/api/search` | 关键词搜索漫画，默认需要 `ENABLE_SEARCH=true` |
 | `POST` | `/api/jobs` | 创建下载任务 |
 | `GET` | `/api/jobs/active?group_id=...&user_id=...` | 查询某个群用户当前活跃任务 |
 | `POST` | `/api/jobs/active/cancel?group_id=...&user_id=...` | 取消某个群用户当前活跃任务 |
 | `GET` | `/api/jobs/{job_id}` | 查询任务状态，包含 `downloaded_files`、`total_files`、`error_code` |
 | `POST` | `/api/jobs/{job_id}/cancel` | 按任务编号取消排队中或下载中的任务 |
 | `GET` | `/api/jobs/{job_id}/file` | 下载 PDF |
+| `GET` | `/api/admin/status` | 查询服务器状态、缓存大小和任务统计 |
+| `GET` | `/api/admin/queue` | 查询当前队列和最近错误任务 |
+| `POST` | `/api/admin/jobs/{target}/cancel` | 管理员按 JM 编号或任务编号取消任务 |
+| `POST` | `/api/admin/cache/cleanup` | 手动清理缓存；有活跃后端任务时会拒绝 |
 
 任务状态：
 
@@ -410,6 +463,7 @@ project/
 │  └─ lang.py
 ├─ backend/
 │  ├─ main.py
+│  ├─ search_worker.py
 │  ├─ downloader.py
 │  ├─ task_manager.py
 │  └─ models.py

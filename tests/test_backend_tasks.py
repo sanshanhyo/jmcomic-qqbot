@@ -10,7 +10,7 @@ import pytest
 
 from backend import downloader
 from backend.models import JobStatus
-from backend.task_manager import DuplicateJobError, JobManager, JobManagerConfig
+from backend.task_manager import ActiveJobLimitError, JobManager, JobManagerConfig
 
 
 @pytest.mark.asyncio
@@ -253,7 +253,7 @@ async def test_cancel_job_returns_before_slow_process_termination(
 
 
 @pytest.mark.asyncio
-async def test_same_user_active_job_is_rejected(tmp_path: Path) -> None:
+async def test_same_user_active_job_is_limited(tmp_path: Path) -> None:
     manager = JobManager(
         JobManagerConfig(
             data_dir=tmp_path / "data",
@@ -266,13 +266,84 @@ async def test_same_user_active_job_is_rejected(tmp_path: Path) -> None:
 
     first = await manager.create_job("111111", "10001", "20001")
 
-    with pytest.raises(DuplicateJobError) as exc_info:
+    with pytest.raises(ActiveJobLimitError) as exc_info:
         await manager.create_job("222222", "10001", "20001")
 
     other_user = await manager.create_job("333333", "10001", "20002")
 
-    assert exc_info.value.existing_job["job_id"] == first["job_id"]
+    assert first["album_id"] == "111111"
+    assert exc_info.value.error_code == "USER_ACTIVE_JOB_LIMIT"
     assert other_user["album_id"] == "333333"
+
+
+@pytest.mark.asyncio
+async def test_group_active_job_limit_is_rejected(tmp_path: Path) -> None:
+    manager = JobManager(
+        JobManagerConfig(
+            data_dir=tmp_path / "data",
+            option_path=tmp_path / "jmcomic-option.yml",
+            max_concurrent_jobs=1,
+            job_timeout_seconds=5,
+            max_active_jobs_per_group=2,
+            max_active_jobs_per_user=0,
+        )
+    )
+    manager.initialize()
+
+    await manager.create_job("111111", "10001", "20001")
+    await manager.create_job("222222", "10001", "20002")
+
+    with pytest.raises(ActiveJobLimitError) as exc_info:
+        await manager.create_job("333333", "10001", "20003")
+
+    assert exc_info.value.error_code == "GROUP_ACTIVE_JOB_LIMIT"
+
+
+@pytest.mark.asyncio
+async def test_user_active_job_limit_is_global(tmp_path: Path) -> None:
+    manager = JobManager(
+        JobManagerConfig(
+            data_dir=tmp_path / "data",
+            option_path=tmp_path / "jmcomic-option.yml",
+            max_concurrent_jobs=1,
+            job_timeout_seconds=5,
+            max_active_jobs_per_group=0,
+            max_active_jobs_per_user=1,
+        )
+    )
+    manager.initialize()
+
+    await manager.create_job("111111", "10001", "20001")
+
+    with pytest.raises(ActiveJobLimitError) as exc_info:
+        await manager.create_job("222222", "10002", "20001")
+
+    assert exc_info.value.error_code == "USER_ACTIVE_JOB_LIMIT"
+
+
+@pytest.mark.asyncio
+async def test_find_job_by_prefix_supports_album_id_and_short_job_id(tmp_path: Path) -> None:
+    manager = JobManager(
+        JobManagerConfig(
+            data_dir=tmp_path / "data",
+            option_path=tmp_path / "jmcomic-option.yml",
+            max_concurrent_jobs=1,
+            job_timeout_seconds=5,
+            max_active_jobs_per_group=0,
+            max_active_jobs_per_user=0,
+        )
+    )
+    manager.initialize()
+
+    job = await manager.create_job("111111", "10001", "20001")
+
+    by_album = manager.find_job_by_prefix("111111")
+    by_job_id = manager.find_job_by_prefix(job["job_id"][:8])
+
+    assert by_album is not None
+    assert by_album["job_id"] == job["job_id"]
+    assert by_job_id is not None
+    assert by_job_id["album_id"] == "111111"
 
 
 @pytest.mark.asyncio
@@ -572,3 +643,32 @@ def test_update_download_progress_counts_images(tmp_path: Path) -> None:
     assert stored is not None
     assert stored["downloaded_files"] == 2
     assert stored["progress_message"] == "下载中，已保存 2 张图片"
+
+
+def test_search_page_to_result_filters_and_limits() -> None:
+    page = SimpleNamespace(
+        total="4",
+        content=[
+            ("123456", {"name": "First", "tags": ["a", "b"]}),
+            ("not-id", {"name": "Bad"}),
+            ("222222", {"title": "Second", "tags": ["x"] * 12}),
+            ("333333", {"name": "Third"}),
+        ],
+    )
+
+    result = downloader._search_page_to_result("test", 1, page, limit=2)
+
+    assert result == {
+        "query": "test",
+        "page": 1,
+        "total": 4,
+        "results": [
+            {"album_id": "123456", "title": "First", "tags": ["a", "b"]},
+            {"album_id": "222222", "title": "Second", "tags": ["x"] * 8},
+        ],
+    }
+
+
+def test_search_query_rejects_blank_text() -> None:
+    with pytest.raises(downloader.SearchError):
+        downloader._normalize_search_query("   ")

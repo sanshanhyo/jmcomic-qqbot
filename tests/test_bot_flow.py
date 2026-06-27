@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Awaitable
 
@@ -12,17 +13,22 @@ from bot.napcat_client import NapCatAPIError
 
 
 class FakeNapCat:
-    def __init__(self, upload_failures: int = 0) -> None:
+    def __init__(self, upload_failures: int = 0, image_failures: int = 0) -> None:
         self.sent: list[tuple[str, str]] = []
         self.uploads: list[tuple[str, Path, str]] = []
         self.upload_attempts = 0
         self.upload_failures = upload_failures
+        self.image_attempts = 0
+        self.image_failures = image_failures
 
     async def send_group_msg(self, group_id: str, message: str | list[dict]) -> dict:
         self.sent.append((group_id, message))
         return {"status": "ok", "retcode": 0}
 
     async def send_group_image(self, group_id: str, image_url: str) -> dict:
+        self.image_attempts += 1
+        if self.image_attempts <= self.image_failures:
+            raise NapCatAPIError("image failed")
         self.sent.append((group_id, f"IMAGE:{image_url}"))
         return {"status": "ok", "retcode": 0}
 
@@ -38,7 +44,9 @@ class FakeCreateBackend:
     def __init__(self, page_count: int | None = 80) -> None:
         self.created: list[tuple[str, str, str, int | None]] = []
         self.previewed: list[str] = []
+        self.searches: list[tuple[str, int, int]] = []
         self.cancelled: list[str] = []
+        self.admin_cancellations: list[str] = []
         self.active_queries: list[tuple[str, str]] = []
         self.cancelled_active: list[tuple[str, str]] = []
         self.active_job: dict | None = None
@@ -63,6 +71,18 @@ class FakeCreateBackend:
             "estimated_text": "预计约 5-8 分钟",
         }
 
+    async def search_albums(self, query: str, page: int = 1, limit: int = 5) -> dict:
+        self.searches.append((query, page, limit))
+        return {
+            "query": query,
+            "page": page,
+            "total": 2,
+            "results": [
+                {"album_id": "111111", "title": "First Search Hit", "tags": ["tag1"]},
+                {"album_id": "222222", "title": "Second Search Hit", "tags": ["tag2"]},
+            ],
+        }
+
     async def create_job(
         self,
         album_id: str,
@@ -76,6 +96,42 @@ class FakeCreateBackend:
     async def cancel_job(self, job_id: str) -> dict:
         self.cancelled.append(job_id)
         return {"job_id": job_id, "status": "failed"}
+
+    async def get_admin_status(self) -> dict:
+        return {
+            "cpu_percent": 12.5,
+            "memory": {"used": 512 * 1024 * 1024, "total": 2 * 1024 * 1024 * 1024},
+            "disk": {
+                "used": 10 * 1024 * 1024 * 1024,
+                "total": 40 * 1024 * 1024 * 1024,
+                "free": 30 * 1024 * 1024 * 1024,
+            },
+            "cache": {"data": 1000, "jobs": 200, "bot_downloads": 300},
+            "network": {"tx_bytes_per_second": 1024, "rx_bytes_per_second": 2048},
+            "jobs": {"downloading": 1, "queued": 2, "converting": 0},
+        }
+
+    async def get_admin_queue(self, limit: int = 20) -> dict:
+        return {
+            "jobs": [
+                {
+                    "job_id": "abcdef1234567890",
+                    "album_id": "123456",
+                    "group_id": "10001",
+                    "user_id": "20001",
+                    "status": "downloading",
+                    "downloaded_files": 50,
+                    "total_files": 100,
+                }
+            ]
+        }
+
+    async def cleanup_cache(self) -> dict:
+        return {"freed_bytes": 2048, "stats": {"job_dirs": 1, "bot_downloads": 2, "previews": 3}}
+
+    async def admin_cancel_job(self, target: str) -> dict:
+        self.admin_cancellations.append(target)
+        return {"job": {"job_id": "abcdef1234567890", "album_id": "123456", "status": "failed"}}
 
 
 class FakeDownloadBackend:
@@ -105,7 +161,7 @@ class TaskCollector:
         awaitable.close()
 
 
-def _settings(tmp_path: Path) -> BotSettings:
+def _settings(tmp_path: Path, enable_search: bool = False) -> BotSettings:
     return BotSettings(
         bot_qq_id="12345",
         napcat_ws_url="ws://127.0.0.1:3001",
@@ -116,14 +172,17 @@ def _settings(tmp_path: Path) -> BotSettings:
         data_dir=tmp_path,
         job_timeout_seconds=30,
         poll_interval_seconds=0.01,
+        enable_search=enable_search,
+        search_confirm_timeout_seconds=60,
     )
 
 
-def _group_event(message: list[dict]) -> dict:
+def _group_event(message: list[dict], user_id: str = "20001", role: str = "member") -> dict:
     return {
         "message_type": "group",
         "group_id": "10001",
-        "user_id": "20001",
+        "user_id": user_id,
+        "sender": {"role": role},
         "message": message,
     }
 
@@ -142,7 +201,8 @@ def test_split_pdf_for_upload_creates_valid_parts(tmp_path: Path) -> None:
     pdf_path = tmp_path / "album.pdf"
     pdf_path.write_bytes(img2pdf.convert([str(path) for path in image_paths]))
 
-    parts = bot_main._split_pdf_for_upload(pdf_path, "album.pdf", max_upload_bytes=100)
+    max_upload_bytes = 2000
+    parts = bot_main._split_pdf_for_upload(pdf_path, "album.pdf", max_upload_bytes=max_upload_bytes)
 
     assert len(parts) == 3
     assert [name for _path, name in parts] == [
@@ -151,6 +211,7 @@ def test_split_pdf_for_upload_creates_valid_parts(tmp_path: Path) -> None:
         "part03-of03_album.pdf",
     ]
     for part_path, _part_name in parts:
+        assert part_path.stat().st_size <= max_upload_bytes
         with pikepdf.Pdf.open(part_path) as part_pdf:
             assert len(part_pdf.pages) == 1
 
@@ -160,8 +221,7 @@ def test_part_filename_is_truncated_by_utf8_bytes() -> None:
 
     part_name = bot_main._part_filename(filename, 1, 3)
 
-    assert part_name.startswith("part01-of03_")
-    assert part_name.endswith(".pdf")
+    assert part_name == "JM434803_part01-of03.pdf"
     assert len(part_name.encode("utf-8")) <= bot_main.MAX_FILENAME_BYTES
 
 
@@ -211,6 +271,112 @@ async def test_handle_group_message_sends_preview_without_creating_job(tmp_path:
     assert napcat.sent[1] == ("10001", "IMAGE:https://example.test/cover.jpg")
     assert "标题是A Test Album" in napcat.sent[2][1]
     assert ("10001", "20001") in state.pending_downloads
+
+
+@pytest.mark.asyncio
+async def test_cover_url_failure_sends_cached_cover(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def fake_download_cover_image(cover_url: str, cache_dir: Path, album_id: str) -> Path:
+        assert cover_url == "https://example.test/cover.jpg"
+        cover_path = cache_dir / f"JM{album_id}.jpg"
+        cover_path.parent.mkdir(parents=True, exist_ok=True)
+        cover_path.write_bytes(b"fake image")
+        return cover_path.resolve()
+
+    monkeypatch.setattr(bot_main, "_download_cover_image", fake_download_cover_image)
+    napcat = FakeNapCat(image_failures=1)
+    backend = FakeCreateBackend()
+    state = BotState(pending_downloads={})
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " JM123456"}},
+            ]
+        ),
+        _settings(tmp_path),
+        state,
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert napcat.image_attempts == 2
+    expected_cover_path = tmp_path.resolve() / "cover_cache" / "JM123456.jpg"
+    assert napcat.sent[1] == ("10001", f"IMAGE:{expected_cover_path}")
+    assert "标题是A Test Album" in napcat.sent[2][1]
+
+
+@pytest.mark.asyncio
+async def test_search_command_is_disabled_by_default(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+    state = BotState(pending_downloads={})
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 搜索 戦乙女"}},
+            ]
+        ),
+        _settings(tmp_path),
+        state,
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert backend.searches == []
+    assert napcat.sent[-1] == ("10001", "搜索功能还没有开启，稍后再来找我吧。")
+    assert state.pending_searches == {}
+
+
+@pytest.mark.asyncio
+async def test_search_result_selection_sends_album_preview(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+    tasks = TaskCollector()
+    state = BotState(pending_downloads={})
+    settings = _settings(tmp_path, enable_search=True)
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 搜索 戦乙女"}},
+            ]
+        ),
+        settings,
+        state,
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        tasks,
+    )
+
+    assert backend.searches == [("戦乙女", 1, 5)]
+    assert ("10001", "20001") in state.pending_searches
+    assert napcat.sent[-1] == (
+        "10001",
+        "搜索结果：戦乙女\n1. JM111111 First Search Hit\n2. JM222222 Second Search Hit\n回复 1-2 选择，回复“取消”放弃。",
+    )
+
+    await handle_group_message(
+        _group_event([{"type": "text", "data": {"text": "1"}}]),
+        settings,
+        state,
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        tasks,
+    )
+
+    assert backend.previewed == ["111111"]
+    assert state.pending_searches == {}
+    assert ("10001", "20001") in state.pending_downloads
+    assert napcat.sent[-3] == ("10001", "已选择 JM111111，我先获取封面和页数给你确认。")
+    assert napcat.sent[-2] == ("10001", "IMAGE:https://example.test/cover.jpg")
+    assert "标题是A Test Album" in napcat.sent[-1][1]
+    assert tasks.count == 0
 
 
 @pytest.mark.asyncio
@@ -352,6 +518,200 @@ async def test_active_download_can_be_cancelled(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_manager_can_query_admin_status(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+    settings = replace(_settings(tmp_path), manager_qq_ids={"2456014618"})
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 状态"}},
+            ],
+            user_id="2456014618",
+            role="member",
+        ),
+        settings,
+        BotState(),
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert "服务器状态" in napcat.sent[-1][1]
+    assert "CPU：12.5%" in napcat.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_group_admin_can_query_queue(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 队列"}},
+            ],
+            role="admin",
+        ),
+        _settings(tmp_path),
+        BotState(),
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert "当前队列" in napcat.sent[-1][1]
+    assert "JM123456 下载中（50%）" in napcat.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_run_admin_status(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 状态"}},
+            ]
+        ),
+        _settings(tmp_path),
+        BotState(),
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert napcat.sent[-1] == ("10001", "这个命令需要群主、群管理员或机器人管理者执行。")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_cache_requires_manager(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 清理缓存"}},
+            ],
+            role="owner",
+        ),
+        _settings(tmp_path),
+        BotState(),
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert napcat.sent[-1] == ("10001", "清理缓存属于维护操作，只允许机器人管理者执行。")
+
+
+@pytest.mark.asyncio
+async def test_manager_can_cleanup_cache(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+    settings = replace(_settings(tmp_path), manager_qq_ids={"2456014618"})
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 清理缓存"}},
+            ],
+            user_id="2456014618",
+        ),
+        settings,
+        BotState(),
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert "缓存清理完成，释放 2.0KB" in napcat.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_cooldown_blocks_repeated_new_command(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+    settings = replace(_settings(tmp_path), user_command_cooldown_seconds=60)
+    state = BotState()
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " JM123456"}},
+            ]
+        ),
+        settings,
+        state,
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " JM654321"}},
+            ]
+        ),
+        settings,
+        state,
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert backend.previewed == ["123456"]
+    assert napcat.sent[-1] == ("10001", "别急别急，60 秒后再发新任务或搜索吧。")
+
+
+@pytest.mark.asyncio
+async def test_admin_cancel_uploading_job_marks_cancelled(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeCreateBackend()
+    settings = replace(_settings(tmp_path), manager_qq_ids={"2456014618"})
+    state = BotState(
+        uploading_jobs={
+            "abcdef1234567890": bot_main.UploadingJob(
+                job_id="abcdef1234567890",
+                album_id="123456",
+                group_id="10001",
+                user_id="20001",
+                started_at=0,
+            )
+        }
+    )
+
+    await handle_group_message(
+        _group_event(
+            [
+                {"type": "at", "data": {"qq": "12345"}},
+                {"type": "text", "data": {"text": " 取消 abcdef12"}},
+            ],
+            user_id="2456014618",
+        ),
+        settings,
+        state,
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        TaskCollector(),
+    )
+
+    assert "abcdef1234567890" in state.cancelled_uploads
+    assert backend.admin_cancellations == []
+    assert "已请求取消上传" in napcat.sent[-1][1]
+
+
+@pytest.mark.asyncio
 async def test_failed_job_message_includes_error_code(tmp_path: Path) -> None:
     napcat = FakeNapCat()
 
@@ -386,13 +746,44 @@ async def test_upload_success(tmp_path: Path) -> None:
 
     assert napcat.upload_attempts == 1
     assert napcat.uploads[0][0] == "10001"
-    assert napcat.uploads[0][2] == "[JM123456]title.pdf"
+    assert napcat.uploads[0][2] == "JM123456.pdf"
+    assert napcat.uploads[0][1].parent.name == "_upload"
+    assert napcat.uploads[0][1].name == "upload_01.pdf"
     assert napcat.sent[-1] == ("10001", "锵锵！JM123456 已完成啦ʕง•ᴥ•ʔ，请你查收⸜(* ॑꒳ ॑* )⸝")
+    assert not (tmp_path / "bot_downloads" / "job-123").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_can_be_cancelled_by_admin_state(tmp_path: Path) -> None:
+    napcat = FakeNapCat()
+    backend = FakeDownloadBackend()
+    state = BotState(cancelled_uploads={"job-123"})
+
+    await _download_and_upload(
+        {"job_id": "job-123", "filename": "[JM123456]title.pdf", "user_id": "20001"},
+        "123456",
+        "10001",
+        _settings(tmp_path),
+        napcat,  # type: ignore[arg-type]
+        backend,  # type: ignore[arg-type]
+        state=state,
+    )
+
+    assert napcat.upload_attempts == 0
+    assert napcat.sent[-1] == ("10001", "JM123456 上传已由管理员取消。")
+    assert state.uploading_jobs == {}
+    assert state.cancelled_uploads == set()
 
 
 @pytest.mark.asyncio
 async def test_large_upload_uses_split_parts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    def fake_prepare_upload_files(pdf_path: Path, _filename: str, _max_upload_bytes: int) -> list[tuple[Path, str]]:
+    def fake_prepare_upload_files(
+        pdf_path: Path,
+        _filename: str,
+        _max_upload_bytes: int,
+        _max_filename_bytes: int,
+        _album_id: str | None,
+    ) -> list[tuple[Path, str]]:
         part1 = pdf_path.parent / "part1.pdf"
         part2 = pdf_path.parent / "part2.pdf"
         part1.write_bytes(b"%PDF-1.4\npart1")
@@ -441,3 +832,51 @@ async def test_upload_retries_until_success(monkeypatch: pytest.MonkeyPatch, tmp
     assert napcat.upload_attempts == 3
     assert len(napcat.uploads) == 1
     assert "JM123456 已完成" in napcat.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_large_failed_upload_splits_once_after_retries(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    def fake_split_for_retry(
+        _pdf_path: Path,
+        _filename: str,
+        _max_filename_bytes: int,
+        _album_id: str | None,
+    ) -> list[tuple[Path, str]]:
+        part1 = tmp_path / "retry-part1.pdf"
+        part2 = tmp_path / "retry-part2.pdf"
+        part1.write_bytes(b"%PDF-1.4\nretry1")
+        part2.write_bytes(b"%PDF-1.4\nretry2")
+        return [(part1, "JM123456_part01-of02.pdf"), (part2, "JM123456_part02-of02.pdf")]
+
+    source_pdf = tmp_path / "large.pdf"
+    with source_pdf.open("wb") as file:
+        file.seek(int(bot_main.DEFAULT_MAX_UPLOAD_BYTES * 0.8))
+        file.write(b"\0")
+
+    monkeypatch.setattr(bot_main, "_split_pdf_for_retry", fake_split_for_retry)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    napcat = FakeNapCat(upload_failures=bot_main.DEFAULT_UPLOAD_RETRIES)
+
+    ok = await bot_main._upload_item_with_fallback(
+        napcat,  # type: ignore[arg-type]
+        "10001",
+        source_pdf,
+        "JM123456.pdf",
+        tmp_path,
+        "job-123",
+        "123456",
+        bot_main.MAX_UPLOAD_FILENAME_BYTES,
+        bot_main.DEFAULT_UPLOAD_RETRIES,
+        label="upload_01",
+    )
+
+    assert ok is True
+    assert napcat.upload_attempts > bot_main.DEFAULT_UPLOAD_RETRIES
+    assert [upload[2] for upload in napcat.uploads] == [
+        "JM123456_part01-of02.pdf",
+        "JM123456_part02-of02.pdf",
+    ]
+    assert any("拆得更细" in str(message) for _group_id, message in napcat.sent)

@@ -155,5 +155,24 @@ class NapCatClient:
         status_value = data.get("status")
         retcode = data.get("retcode")
         if status_value != "ok" or retcode != 0:
-            raise NapCatAPIError(f"NapCat API 返回失败：status={status_value}, retcode={retcode}")
+            detail = self._error_detail(data)
+            suffix = f", detail={detail}" if detail else ""
+            raise NapCatAPIError(f"NapCat API 返回失败：status={status_value}, retcode={retcode}{suffix}")
         return data
+
+    @staticmethod
+    def _error_detail(data: dict[str, Any]) -> str:
+        details: list[str] = []
+        for key in ("message", "msg", "wording"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                details.append(f"{key}={value[:200]}")
+        nested = data.get("data")
+        if isinstance(nested, str) and nested:
+            details.append(f"data={nested[:200]}")
+        elif isinstance(nested, dict):
+            for key in ("message", "msg", "wording", "error"):
+                value = nested.get(key)
+                if isinstance(value, str) and value:
+                    details.append(f"data.{key}={value[:200]}")
+        return "; ".join(details)

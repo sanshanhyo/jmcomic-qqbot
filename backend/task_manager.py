@@ -41,6 +41,13 @@ class DuplicateJobError(Exception):
         self.existing_job = existing_job
 
 
+class ActiveJobLimitError(Exception):
+    def __init__(self, user_message: str, error_code: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+        self.error_code = error_code
+
+
 class DownloadWorkerError(Exception):
     def __init__(self, user_message: str, error_code: str = ErrorCode.JM_DOWNLOAD_FAILED) -> None:
         super().__init__(user_message)
@@ -67,6 +74,8 @@ class JobManagerConfig:
     job_cache_ttl_seconds: int = 259200
     bot_download_cache_ttl_seconds: int = 259200
     preview_cache_ttl_seconds: int = 86400
+    max_active_jobs_per_group: int = 3
+    max_active_jobs_per_user: int = 1
 
 
 class JobManager:
@@ -171,11 +180,27 @@ class JobManager:
         return await asyncio.to_thread(self._cleanup_cache_sync)
 
     async def create_job(self, album_id: str, group_id: str, user_id: str, page_count: int | None = None) -> dict[str, Any]:
-        existing = self.find_active_job_for_user(group_id, user_id)
-        if existing is None:
-            existing = self.find_active_job(album_id, group_id)
+        existing = self.find_active_job(album_id, group_id)
         if existing is not None:
             raise DuplicateJobError(existing)
+
+        if (
+            self.config.max_active_jobs_per_group > 0
+            and self.count_active_jobs_for_group(group_id) >= self.config.max_active_jobs_per_group
+        ):
+            raise ActiveJobLimitError(
+                f"本群当前任务已满（最多 {self.config.max_active_jobs_per_group} 个），请稍后再试",
+                "GROUP_ACTIVE_JOB_LIMIT",
+            )
+
+        if (
+            self.config.max_active_jobs_per_user > 0
+            and self.count_active_jobs_for_user(user_id) >= self.config.max_active_jobs_per_user
+        ):
+            raise ActiveJobLimitError(
+                f"你已经有正在进行的任务啦（最多 {self.config.max_active_jobs_per_user} 个）",
+                "USER_ACTIVE_JOB_LIMIT",
+            )
 
         now = self._now()
         job_id = str(uuid.uuid4())
@@ -221,7 +246,7 @@ class JobManager:
         user_id: str,
         reason: str = "任务已取消",
     ) -> dict[str, Any] | None:
-        job = self.find_active_job_for_user(group_id, user_id)
+        job = self.find_active_job_for_user(group_id=group_id, user_id=user_id)
         if job is None:
             return None
         return await self.cancel_job(str(job["job_id"]), reason)
@@ -292,29 +317,161 @@ class JobManager:
             return None
         return path, filename
 
-    def find_active_job_for_user(self, group_id: str, user_id: str) -> dict[str, Any] | None:
+    def find_active_job_for_user(self, group_id: str | None = None, user_id: str | None = None) -> dict[str, Any] | None:
+        if user_id is None:
+            return None
+        where = ["user_id = ?", "status IN (?, ?, ?)"]
+        params: list[object] = [
+            user_id,
+            JobStatus.QUEUED.value,
+            JobStatus.DOWNLOADING.value,
+            JobStatus.CONVERTING.value,
+        ]
+        if group_id is not None:
+            where.insert(0, "group_id = ?")
+            params.insert(0, group_id)
         with self._connect() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT job_id, album_id, group_id, user_id, status,
                        filename, file_path, error_message, error_code, downloaded_files,
                        total_files, progress_message, created_at, updated_at
                 FROM jobs
-                WHERE group_id = ?
-                  AND user_id = ?
-                  AND status IN (?, ?, ?)
+                WHERE {' AND '.join(where)}
                 ORDER BY created_at ASC
                 LIMIT 1
                 """,
+                tuple(params),
+            ).fetchone()
+        return self._row_to_dict(row) if row else None
+
+    def count_active_jobs_for_group(self, group_id: str) -> int:
+        return self._count_active_jobs("group_id", group_id)
+
+    def count_active_jobs_for_user(self, user_id: str) -> int:
+        return self._count_active_jobs("user_id", user_id)
+
+    def count_active_jobs(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM jobs
+                WHERE status IN (?, ?, ?)
+                """,
                 (
-                    group_id,
-                    user_id,
                     JobStatus.QUEUED.value,
                     JobStatus.DOWNLOADING.value,
                     JobStatus.CONVERTING.value,
                 ),
             ).fetchone()
-        return self._row_to_dict(row) if row else None
+        return int(row["count"] or 0) if row else 0
+
+    def list_admin_jobs(self, limit: int = 20) -> list[dict[str, Any]]:
+        limit = max(1, min(50, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT job_id, album_id, group_id, user_id, status,
+                       filename, file_path, error_message, error_code, downloaded_files,
+                       total_files, progress_message, created_at, updated_at
+                FROM jobs
+                WHERE status IN (?, ?, ?, ?)
+                ORDER BY
+                    CASE status
+                        WHEN ? THEN 0
+                        WHEN ? THEN 1
+                        WHEN ? THEN 2
+                        WHEN ? THEN 3
+                        ELSE 4
+                    END,
+                    updated_at DESC
+                LIMIT ?
+                """,
+                (
+                    JobStatus.QUEUED.value,
+                    JobStatus.DOWNLOADING.value,
+                    JobStatus.CONVERTING.value,
+                    JobStatus.FAILED.value,
+                    JobStatus.DOWNLOADING.value,
+                    JobStatus.CONVERTING.value,
+                    JobStatus.QUEUED.value,
+                    JobStatus.FAILED.value,
+                    limit,
+                ),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def find_job_by_prefix(self, target: str) -> dict[str, Any] | None:
+        target = target.strip()
+        if not target:
+            return None
+        if target.isdigit():
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT job_id, album_id, group_id, user_id, status,
+                           filename, file_path, error_message, error_code, downloaded_files,
+                           total_files, progress_message, created_at, updated_at
+                    FROM jobs
+                    WHERE album_id = ?
+                      AND status IN (?, ?, ?)
+                    ORDER BY created_at DESC
+                    LIMIT 2
+                    """,
+                    (
+                        target,
+                        JobStatus.QUEUED.value,
+                        JobStatus.DOWNLOADING.value,
+                        JobStatus.CONVERTING.value,
+                    ),
+                ).fetchall()
+            if len(rows) == 1:
+                return self._row_to_dict(rows[0])
+            if len(rows) > 1:
+                return None
+
+        if len(target) >= 32:
+            job = self.get_job(target)
+            if job is not None:
+                return job
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT job_id, album_id, group_id, user_id, status,
+                       filename, file_path, error_message, error_code, downloaded_files,
+                       total_files, progress_message, created_at, updated_at
+                FROM jobs
+                WHERE job_id LIKE ?
+                ORDER BY created_at DESC
+                LIMIT 2
+                """,
+                (f"{target}%",),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        return self._row_to_dict(rows[0])
+
+    def _count_active_jobs(self, column: str, value: str) -> int:
+        if column not in {"group_id", "user_id"}:
+            raise ValueError("invalid active job counter")
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(*) AS count
+                FROM jobs
+                WHERE {column} = ?
+                  AND status IN (?, ?, ?)
+                """,
+                (
+                    value,
+                    JobStatus.QUEUED.value,
+                    JobStatus.DOWNLOADING.value,
+                    JobStatus.CONVERTING.value,
+                ),
+            ).fetchone()
+        return int(row["count"] or 0) if row else 0
 
     def find_active_job(self, album_id: str, group_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:

@@ -47,3 +47,22 @@ class AlbumPreviewResponse(BaseModel):
     page_count_is_estimated: bool = False
     estimated_seconds: int | None = None
     estimated_text: str
+
+
+class AlbumSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=40)
+    page: int = Field(default=1, ge=1, le=5)
+    limit: int = Field(default=5, ge=1, le=10)
+
+
+class AlbumSearchItem(BaseModel):
+    album_id: str = Field(pattern=r"^\d{1,12}$")
+    title: str
+    tags: list[str] = Field(default_factory=list)
+
+
+class AlbumSearchResponse(BaseModel):
+    query: str
+    page: int
+    total: int
+    results: list[AlbumSearchItem]

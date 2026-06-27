@@ -48,6 +48,10 @@ class PreviewError(DownloaderError):
     pass
 
 
+class SearchError(DownloaderError):
+    pass
+
+
 def _truncate_utf8(text: str, max_bytes: int) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:
@@ -463,6 +467,80 @@ def format_estimated_time(seconds: int | None) -> str:
     if minutes == high_minutes:
         return f"预计约 {minutes} 分钟"
     return f"预计约 {minutes}-{high_minutes} 分钟"
+
+
+def _normalize_search_query(query: str) -> str:
+    normalized = re.sub(r"\s+", " ", query).strip()
+    if not normalized:
+        raise SearchError("搜索关键词不能为空")
+    if len(normalized) > 40:
+        raise SearchError("搜索关键词太长啦，请控制在 40 个字符以内")
+    return normalized
+
+
+def _search_page_to_result(query: str, page: int, search_page: object, limit: int) -> dict:
+    results: list[dict[str, object]] = []
+    content = getattr(search_page, "content", [])
+    if not isinstance(content, list):
+        content = []
+
+    for item in content:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        album_id, info = item[0], item[1]
+        album_id = str(album_id)
+        if not ALBUM_ID_RE.fullmatch(album_id):
+            continue
+        info = info if isinstance(info, dict) else {}
+        title = str(info.get("name") or info.get("title") or f"JM{album_id}")
+        raw_tags = info.get("tags")
+        tags = [str(tag) for tag in raw_tags[:8]] if isinstance(raw_tags, list) else []
+        results.append({"album_id": album_id, "title": title, "tags": tags})
+        if len(results) >= limit:
+            break
+
+    try:
+        total = int(getattr(search_page, "total", len(results)) or 0)
+    except (TypeError, ValueError):
+        total = len(results)
+
+    return {
+        "query": query,
+        "page": page,
+        "total": max(total, len(results)),
+        "results": results,
+    }
+
+
+def search_albums(query: str, option_path: str | Path, page: int = 1, limit: int = 5) -> dict:
+    query = _normalize_search_query(query)
+    page = max(1, min(int(page), 5))
+    limit = max(1, min(int(limit), 10))
+
+    option_file = Path(option_path).expanduser().resolve()
+    if not option_file.is_file():
+        raise SearchError("JMComic 配置文件不存在，请检查 JMCOMIC_OPTION_PATH")
+
+    try:
+        from jmcomic import create_option_by_file
+    except ImportError as exc:
+        raise SearchError("未安装 jmcomic，请先安装项目依赖") from exc
+
+    stdout = StringIO()
+    stderr = StringIO()
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            option = create_option_by_file(str(option_file))
+            client = option.new_jm_client()
+            search_page = client.search_site(query, page=page)
+        _log_captured_jmcomic_output(stdout, stderr)
+    except DownloaderError:
+        raise
+    except Exception as exc:
+        _log_captured_jmcomic_output(stdout, stderr)
+        raise SearchError(_download_error_message(exc)) from exc
+
+    return _search_page_to_result(query, page, search_page, limit)
 
 
 def fetch_album_preview(album_id: str, option_path: str | Path) -> dict:

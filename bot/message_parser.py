@@ -6,6 +6,7 @@ from enum import StrEnum
 from typing import Any
 
 ALBUM_PATTERN = re.compile(r"(?i)\bJM\s*(\d{1,12})\b")
+SEARCH_PATTERN = re.compile(r"^\s*(?:搜索|搜|查找)\s*(.*)$", re.S)
 CQ_CODE_PATTERN = re.compile(r"\[CQ:([a-zA-Z0-9_]+)((?:,[^\]]*)?)\]")
 
 
@@ -13,6 +14,7 @@ class ParseAction(StrEnum):
     IGNORE = "ignore"
     USAGE = "usage"
     OK = "ok"
+    SEARCH = "search"
     ERROR = "error"
 
 
@@ -20,6 +22,7 @@ class ParseAction(StrEnum):
 class ParseResult:
     action: ParseAction
     album_id: str | None = None
+    search_query: str | None = None
     error_key: str | None = None
 
 
@@ -102,6 +105,19 @@ def extract_album_id(message_segments: Any) -> tuple[str | None, str | None]:
     return matches[0], None
 
 
+def extract_search_query(message_segments: Any) -> tuple[str | None, str | None]:
+    text = text_from_segments(message_segments)
+    match = SEARCH_PATTERN.match(text)
+    if match is None:
+        return None, None
+    query = re.sub(r"\s+", " ", match.group(1)).strip()
+    if not query:
+        return None, "search_usage"
+    if len(query) > 40:
+        return None, "search_query_too_long"
+    return query, None
+
+
 def parse_group_message(event: dict[str, Any], bot_qq_id: str) -> ParseResult:
     if event.get("message_type") != "group":
         return ParseResult(ParseAction.IGNORE)
@@ -112,6 +128,12 @@ def parse_group_message(event: dict[str, Any], bot_qq_id: str) -> ParseResult:
     message_segments = event.get("message")
     if not has_at_bot(message_segments, bot_qq_id):
         return ParseResult(ParseAction.IGNORE)
+
+    search_query, search_error = extract_search_query(message_segments)
+    if search_error:
+        return ParseResult(ParseAction.ERROR, error_key=search_error)
+    if search_query is not None:
+        return ParseResult(ParseAction.SEARCH, search_query=search_query)
 
     album_id, error = extract_album_id(message_segments)
     if error:

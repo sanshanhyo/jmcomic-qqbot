@@ -22,6 +22,10 @@ class DuplicateJobError(BackendError):
         self.status = status
 
 
+class JobLimitError(BackendError):
+    pass
+
+
 class BackendClient:
     def __init__(self, base_url: str, api_token: str | None = None, timeout: float = 30.0) -> None:
         self.base_url = base_url.rstrip("/")
@@ -61,10 +65,57 @@ class BackendClient:
             detail = self._detail(response)
             raise DuplicateJobError(detail.get("job_id"), detail.get("status"), detail.get("error_code"))
 
+        if response.status_code == 429:
+            detail = self._detail(response)
+            message = str(detail.get("message") or "任务数量已达上限")
+            raise JobLimitError(message, str(detail.get("error_code") or "ACTIVE_JOB_LIMIT"))
+
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise BackendError("后端创建任务失败", "BACKEND_CREATE_JOB_FAILED") from exc
+        return response.json()
+
+    async def get_admin_status(self) -> dict[str, Any]:
+        try:
+            response = await self._client.get("/api/admin/status", headers=self._headers(), timeout=10.0)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise BackendError("后端状态查询失败", "BACKEND_ADMIN_STATUS_FAILED") from exc
+        return response.json()
+
+    async def get_admin_queue(self, limit: int = 20) -> dict[str, Any]:
+        try:
+            response = await self._client.get(
+                "/api/admin/queue",
+                params={"limit": limit},
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise BackendError("后端队列查询失败", "BACKEND_ADMIN_QUEUE_FAILED") from exc
+        return response.json()
+
+    async def cleanup_cache(self) -> dict[str, Any]:
+        try:
+            response = await self._client.post("/api/admin/cache/cleanup", headers=self._headers(), timeout=60.0)
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = self._error_detail_message(exc.response) or "缓存清理失败"
+            raise BackendError(message, "BACKEND_CACHE_CLEANUP_FAILED") from exc
+        except httpx.HTTPError as exc:
+            raise BackendError("后端缓存清理失败", "BACKEND_CACHE_CLEANUP_FAILED") from exc
+        return response.json()
+
+    async def admin_cancel_job(self, target: str) -> dict[str, Any]:
+        try:
+            response = await self._client.post(f"/api/admin/jobs/{target}/cancel", headers=self._headers())
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = self._error_detail_message(exc.response) or "任务取消失败"
+            raise BackendError(message, "BACKEND_ADMIN_CANCEL_FAILED") from exc
+        except httpx.HTTPError as exc:
+            raise BackendError("后端任务取消失败", "BACKEND_ADMIN_CANCEL_FAILED") from exc
         return response.json()
 
     async def get_job(self, job_id: str) -> dict[str, Any]:
@@ -118,6 +169,22 @@ class BackendClient:
         except httpx.HTTPStatusError as exc:
             message = self._error_detail_message(exc.response) or "获取漫画信息失败"
             raise BackendError(message, "BACKEND_PREVIEW_FAILED") from exc
+        except httpx.HTTPError as exc:
+            raise BackendError("后端不可用，请稍后再试", "BACKEND_UNAVAILABLE") from exc
+        return response.json()
+
+    async def search_albums(self, query: str, page: int = 1, limit: int = 5) -> dict[str, Any]:
+        try:
+            response = await self._client.post(
+                "/api/search",
+                json={"query": query, "page": page, "limit": limit},
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            message = self._error_detail_message(exc.response) or "搜索失败，请稍后再试"
+            error_code = "SEARCH_DISABLED" if exc.response.status_code == 403 else "BACKEND_SEARCH_FAILED"
+            raise BackendError(message, error_code) from exc
         except httpx.HTTPError as exc:
             raise BackendError("后端不可用，请稍后再试", "BACKEND_UNAVAILABLE") from exc
         return response.json()

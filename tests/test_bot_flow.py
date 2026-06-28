@@ -307,7 +307,7 @@ async def test_empty_at_sends_home_message(tmp_path: Path) -> None:
 
     assert "这里是「测试机器人」" in napcat.sent[-1][1]
     assert "散山肆水HyO（QQ：2456014618）" in napcat.sent[-1][1]
-    assert "https://github.com/sanshanhyo/jmcomic-qqbot" in napcat.sent[-1][1]
+    assert "https://github.com/sanshanhyo/SanBot" in napcat.sent[-1][1]
 
 
 @pytest.mark.asyncio

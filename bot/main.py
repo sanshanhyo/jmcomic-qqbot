@@ -117,7 +117,7 @@ class BotSettings:
     search_confirm_timeout_seconds: int = 600
     user_command_cooldown_seconds: int = DEFAULT_USER_COMMAND_COOLDOWN_SECONDS
     manager_qq_ids: set[str] = field(default_factory=set)
-    bot_display_name: str = "JMComic QQBot"
+    bot_display_name: str = "SanBot"
     manager_name: str = "管理者"
     manager_qq: str = "未配置"
 
@@ -158,7 +158,7 @@ class BotSettings:
                 _env_int("USER_COMMAND_COOLDOWN_SECONDS", DEFAULT_USER_COMMAND_COOLDOWN_SECONDS),
             ),
             manager_qq_ids=manager_qq_ids,
-            bot_display_name=os.getenv("BOT_DISPLAY_NAME") or "JMComic QQBot",
+            bot_display_name=os.getenv("BOT_DISPLAY_NAME") or "SanBot",
             manager_name=os.getenv("BOT_MANAGER_NAME") or "管理者",
             manager_qq=manager_qq,
         )
@@ -1132,7 +1132,7 @@ async def _download_cover_image(cover_url: str, cache_dir: Path, album_id: str) 
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(COVER_DOWNLOAD_TIMEOUT_SECONDS),
-            headers={"User-Agent": "qqbot-jmcomic/0.1"},
+            headers={"User-Agent": "sanbot/0.1"},
         ) as client:
             async with client.stream("GET", cover_url) as response:
                 response.raise_for_status()

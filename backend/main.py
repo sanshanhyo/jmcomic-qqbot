@@ -144,7 +144,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await manager.stop()
 
 
-app = FastAPI(title="QQBot JMComic Backend", lifespan=lifespan)
+app = FastAPI(title="SanBot Backend", lifespan=lifespan)
 
 
 def _manager(request: Request) -> JobManager:

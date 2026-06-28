@@ -1,7 +1,7 @@
 [project]
-name = "qqbot-jmcomic"
+name = "sanbot"
 version = "0.1.0"
-description = "NapCatQQ OneBot 11 group bot for downloading JMComic albums as PDFs."
+description = "SanBot: a NapCatQQ OneBot 11 group bot with JMComic download support."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
